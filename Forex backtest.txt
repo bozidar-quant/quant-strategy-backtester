@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+forex_backtest.py - spot EUR/USD + trailing stop, posteno (train/test)
+======================================================================
+
+Cilj: ima li jednostavno pravilo ulaza (breakout ILI reverzal) + trailing stop
+edge na EUR/USD, kad se postuje disciplina (stelanje na train dijelu,
+provjera na test dijelu koji se dirne jednom).
+
+Ulazi (jednostavni, transparentni - manje parametara = manje overfita):
+  - BREAKOUT: long kad cijena probije max zadnjih L minuta; short na min.
+  - REVERZAL: long kad RSI < donji prag (preprodano); short kad RSI > gornji.
+
+Izlaz: trailing stop od T pipsa (+ max drzanje da trade ne visi zauvijek).
+Trosak: spread+komisija ~0.6 pip po trade-u (konzervativno za ECN EUR/USD).
+
+Disciplina: za svaku ideju biram najbolji config po TRAIN total-pips,
+pa prijavljujem TEST rezultat (gledan jednom).
+"""
+
+import sys
+import numpy as np
+import pandas as pd
+
+PIP = 0.0001
+COST_PIPS = 0.6          # round-trip spread+komisija (konzervativno)
+MAX_HOLD = 240           # max drzanje pozicije u minutama (4h)
+TRAIN_FRAC = 0.60        # prvih 60% = train, ostatak = test
+
+def load(path):
+    d = pd.read_csv(path)
+    d.columns = [c.strip() for c in d.columns]
+    tcol = [c for c in d.columns if c.lower().startswith("time")][0]
+    d = d.rename(columns={tcol: "time"})
+    d["time"] = pd.to_datetime(d["time"], format="%Y.%m.%d %H:%M:%S", errors="coerce")
+    if d["time"].isna().all():
+        d["time"] = pd.to_datetime(d["time"], errors="coerce")
+    d = d.dropna(subset=["time"]).reset_index(drop=True)
+    for c in ["Open", "High", "Low", "Close"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    return d.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
+
+def rsi(close, period=14):
+    delta = close.diff()
+    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    dn = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / dn.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+def signals_breakout(d, L):
+    hi = d["High"].rolling(L).max().shift(1)
+    lo = d["Low"].rolling(L).min().shift(1)
+    sig = np.zeros(len(d), dtype=int)
+    sig[(d["Close"] > hi).values] = 1
+    sig[(d["Close"] < lo).values] = -1
+    return sig
+
+def signals_reversal(d, lo_th, hi_th, period=14):
+    r = rsi(d["Close"], period)
+    sig = np.zeros(len(d), dtype=int)
+    sig[(r < lo_th).values] = 1
+    sig[(r > hi_th).values] = -1
+    return sig
+
+def simulate(d, sig, trail_pips, cost_pips=COST_PIPS, max_hold=MAX_HOLD):
+    """Jedna pozicija u isto vrijeme. Trailing stop, bez look-ahead.
+       Vraca listu pnl-ova u pipsima (vec umanjeno za trosak)."""
+    high = d["High"].values; low = d["Low"].values; close = d["Close"].values
+    T = trail_pips * PIP
+    n = len(d)
+    pnls = []
+    i = 0
+    while i < n - 1:
+        s = sig[i]
+        if s == 0:
+            i += 1; continue
+        entry = close[i]
+        if s == 1:   # LONG
+            stop = entry - T; peak = entry
+            j = i + 1; exit_price = None
+            while j < n and (j - i) <= max_hold:
+                if low[j] <= stop:               # prvo provjeri stop (od peaka do j-1)
+                    exit_price = stop; break
+                if high[j] > peak:
+                    peak = high[j]; stop = max(stop, peak - T)
+                j += 1
+            if exit_price is None:
+                exit_price = close[min(j, n - 1)]
+            pnls.append((exit_price - entry) / PIP - cost_pips)
+        else:        # SHORT
+            stop = entry + T; trough = entry
+            j = i + 1; exit_price = None
+            while j < n and (j - i) <= max_hold:
+                if high[j] >= stop:
+                    exit_price = stop; break
+                if low[j] < trough:
+                    trough = low[j]; stop = min(stop, trough + T)
+                j += 1
+            if exit_price is None:
+                exit_price = close[min(j, n - 1)]
+            pnls.append((entry - exit_price) / PIP - cost_pips)
+        i = j + 1     # nastavi nakon izlaska (jedna pozicija u isto vrijeme)
+    return np.array(pnls)
+
+def metrics(pnls):
+    if len(pnls) == 0:
+        return dict(n=0, wr=np.nan, total=0.0, avg=np.nan, pf=np.nan)
+    wins = pnls[pnls > 0]; losses = pnls[pnls <= 0]
+    pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else np.inf
+    return dict(n=len(pnls), wr=(pnls > 0).mean(),
+                total=pnls.sum(), avg=pnls.mean(), pf=pf)
+
+def fmt(m):
+    if m["n"] == 0:
+        return "n=0"
+    return (f"n={m['n']:<5} WR={m['wr']*100:4.1f}%  total={m['total']:+8.1f}p  "
+            f"avg={m['avg']:+5.2f}p  PF={m['pf']:.2f}")
+
+def run():
+    path = sys.argv[1]
+    d = load(path)
+    split = int(len(d) * TRAIN_FRAC)
+    tr = d.iloc[:split].reset_index(drop=True)
+    te = d.iloc[split:].reset_index(drop=True)
+    print(f"Ucitano {len(d)} barova  ({d['time'].min()} -> {d['time'].max()})")
+    print(f"TRAIN: {len(tr)} barova ({tr['time'].min().date()} -> {tr['time'].max().date()})")
+    print(f"TEST : {len(te)} barova ({te['time'].min().date()} -> {te['time'].max().date()})")
+    print(f"Trosak: {COST_PIPS}p/trade   Trailing kandidati: 10/15/20/30p   Max hold: {MAX_HOLD}min")
+    print("=" * 78)
+
+    trails = [10, 15, 20, 30]
+
+    strategies = {
+        "BREAKOUT": [("L", L) for L in [30, 60, 120]],
+        "REVERZAL": [("RSI", th) for th in [(25, 75), (30, 70), (20, 80)]],
+    }
+
+    for name, configs in strategies.items():
+        print(f"\n### {name} ###")
+        # grid na TRAIN, biraj po total pips
+        best = None
+        for cfg in configs:
+            for T in trails:
+                if name == "BREAKOUT":
+                    sig = signals_breakout(tr, cfg[1])
+                else:
+                    sig = signals_reversal(tr, cfg[1][0], cfg[1][1])
+                m = metrics(simulate(tr, sig, T))
+                if m["n"] >= 30 and (best is None or m["total"] > best[0]["total"]):
+                    best = (m, cfg, T)
+        if best is None:
+            print("  nema dovoljno trade-ova u gridu"); continue
+        m_tr, cfg, T = best
+        # primijeni isti config na TEST (gledamo jednom)
+        if name == "BREAKOUT":
+            sig_te = signals_breakout(te, cfg[1]); label = f"L={cfg[1]}, trail={T}p"
+        else:
+            sig_te = signals_reversal(te, cfg[1][0], cfg[1][1]); label = f"RSI{cfg[1]}, trail={T}p"
+        m_te = metrics(simulate(te, sig_te, T))
+        print(f"  najbolji na TRAIN: {label}")
+        print(f"  TRAIN: {fmt(m_tr)}")
+        print(f"  TEST : {fmt(m_te)}")
+        # verdikt
+        if m_te["n"] < 30:
+            print("  -> premalo trade-ova na testu za zakljucak.")
+        elif m_te["total"] > 0 and m_te["avg"] > 0:
+            print("  -> POZITIVNO na testu (out-of-sample). Vrijedi paznje.")
+        else:
+            print("  -> GUBI na testu. Najbolji-na-train se nije prenio (overfit/nema edge).")
+
+    print("\n" + "=" * 78)
+    print("Napomena: total/avg su u pipsima, vec umanjeni za trosak. PF>1 = profitabilno.")
+    print("Kljuc je TEST red (dio koji nismo stelali). TRAIN uvijek izgleda bolje.")
+
+if __name__ == "__main__":
+    run()
